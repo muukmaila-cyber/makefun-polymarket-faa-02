@@ -6,24 +6,29 @@ leaderboard — the practice is NVIDIA data whose answers are public and whose
 rank-1 loss of 0 is a hardcode, not forecasting):
 
 - Logit space: forecast in logit(p) so low prices (0.006-0.04) behave well.
-- Trend-following drift: the FAA markets fell hard in their first hours
-  (Iran 0.515 -> 0.021); mean-reversion to a 24h anchor PULLS UP and hurts
-  (backtest: mr24 0.668 vs baseline 0.662). Instead drift = recent 240-min
-  logit trend x 0.4/hour, so the model follows the market's direction and
-  flattens to persistence when prices stabilise.
-- Wide mixture tails: FAA jumps are huge (1-min logit move up to 2.6, Iran
-  -0.215 in one minute), so quantiles use a two-component mixture
-  (85% N(0,0.03^2) + 15% N(0,0.15^2)) instead of a narrow normal.
-  Precomputed quantiles Z = [-0.0815, -0.0236, 0, 0.0236, 0.0815] per sqrt(min).
-  No level-dependent spread: on FAA's low prices it added nothing in backtest.
+- Trend-following drift: drift = recent 240-min logit trend x K/hour.
+- Downward bias correction (v3, from calibration audit): the model's
+  quantiles were systematically too high (median coverage 0.441 vs ideal
+  0.50, q75 0.615 vs 0.75, 90% coverage 0.802 vs 0.90). A downward logit
+  bias, scaling with sqrt(horizon), corrects this. Bias -0.30 at h=240.
+- Wide mixture tails: FAA jumps are huge (1-min logit move up to 2.6),
+  so quantiles use a two-component mixture (85% N(0,0.03^2) +
+  15% N(0,0.12^2)) instead of a narrow normal.
+  Precomputed quantiles Z = [-0.070275, -0.023224, 0, 0.023224, 0.070275]
+  per sqrt(min). No level-dependent spread.
 
-Backtest on FAA history (16 checkpoints, 240-min horizon):
-  v1 (K 0.4, s2 0.15) 0.3576 -> v2 (K 0.6, s2 0.12) 0.3398,
-  house baseline 0.6365. Asymmetric upper tails were tried and REJECTED
-  (0.43-0.79): FAA history almost always falls, so widening only the top
-  quantiles costs far more than it saves.
-On NVIDIA practice (dev, different regime) v2 scores ~0.38, ~baseline —
-the dev score is not the target; the final FAA window is.
+Backtest on FAA history (16 checkpoints, 240-min horizon, 4 markets):
+  v1 (K 0.4, s2 0.15) 0.3576 -> v2 (K 0.6, s2 0.12) 0.3398
+  -> v3 (K 0.35, bias -0.30) 0.3043, house baseline 0.6365.
+  v3 is a 10.4% improvement over v2 on FAA and also beats the house
+  baseline on NVIDIA practice (0.3524 vs 0.3636), while v2 did not
+  (0.4038). Parameters chosen for ROBUSTNESS across both regimes, not
+  for the extreme FAA-only optimum (K 0.2, bias -0.60 scores 0.2894 on
+  FAA but 0.3896 on NVIDIA — overfit, rejected).
+Asymmetric upper tails were tried and REJECTED (0.43-0.79). Horizon
+decay was tried and REJECTED (0.39-0.56). Regime detection, cross-market
+features, two-component trend, per-market tails, regression trend, EWMA,
+vol-adaptive spread — all tried and REJECTED (all worse than v2).
 Deterministic, no network, stdlib only.
 """
 import json
@@ -31,14 +36,17 @@ import math
 import os
 
 TAUS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# v2 (koreksi atas perintah user): trend lebih kuat (K 0.4 -> 0.6) + ekor
-# mixture sedikit lebih sempit (s2 0.15 -> 0.12). Backtest FAA: v1 0.3576
-# -> v2 0.3398 (baseline 0.6365). Ekor asimetris DICOBA dan DITOLAK:
-# memperlebar kuantil atas saja merusak skor (0.43-0.79) karena histori FAA
-# hampir selalu turun; ekor simetris terbukti terbaik.
+# v3 (audit + kalibrasi, MASTER INSTRUCTION 14 Nov 2026):
+# K 0.6 -> 0.35 (tren lebih lemah) + bias logit -0.30 (koreksi kalibrasi).
+# Backtest FAA: v2 0.3398 -> v3 0.3043 (baseline 0.6365).
+# NVIDIA: v2 0.4038 -> v3 0.3524 (baseline 0.3636) — v3 mengalahkan
+# baseline di KEDUA rezim, v2 tidak. Parameter dipilih untuk robustness,
+# bukan optimum ekstrem FAA saja (K 0.2/bias -0.60 = 0.2894 FAA tapi
+# 0.3896 NVIDIA = overfit, ditolak).
 Z = [-0.070275, -0.023224, 0.0, 0.023224, 0.070275]
 WIN = 240
-K = 0.6
+K = 0.35
+BIAS = -0.30
 
 
 def sigmoid(x):
@@ -50,7 +58,7 @@ def sigmoid(x):
 
 
 def logit(p):
-    p = min(max(p, 1e-6), 1 - 1e-6)
+    p = min(max(p, 1e-6), 1-1e-6)
     return math.log(p / (1 - p))
 
 
@@ -66,7 +74,7 @@ def forecast_case(case):
         drift = (lx - logit(prices[-1 - w])) * (60.0 / w) * K if w > 0 else 0.0
         rows = []
         for h in range(1, horizon + 1):
-            center = lx + drift * h / 60.0
+            center = lx + drift * h / 60.0 + BIAS * math.sqrt(h) / math.sqrt(240.0)
             s = math.sqrt(h)
             row = []
             for z in Z:
