@@ -17,9 +17,12 @@ rank-1 loss of 0 is a hardcode, not forecasting):
   Precomputed quantiles Z = [-0.0815, -0.0236, 0, 0.0236, 0.0815] per sqrt(min).
   No level-dependent spread: on FAA's low prices it added nothing in backtest.
 
-Backtest on FAA history (15 checkpoints, 240-min horizon):
-  this model 0.3703 vs house baseline 0.6623 (44% better), stable early/late.
-On NVIDIA practice (dev, different regime) it scores ~0.367, ~baseline —
+Backtest on FAA history (16 checkpoints, 240-min horizon):
+  v1 (K 0.4, s2 0.15) 0.3576 -> v2 (K 0.6, s2 0.12) 0.3398,
+  house baseline 0.6365. Asymmetric upper tails were tried and REJECTED
+  (0.43-0.79): FAA history almost always falls, so widening only the top
+  quantiles costs far more than it saves.
+On NVIDIA practice (dev, different regime) v2 scores ~0.38, ~baseline —
 the dev score is not the target; the final FAA window is.
 Deterministic, no network, stdlib only.
 """
@@ -28,9 +31,14 @@ import math
 import os
 
 TAUS = [0.05, 0.25, 0.5, 0.75, 0.95]
-Z = [-0.0815, -0.0236, 0.0, 0.0236, 0.0815]
+# v2 (koreksi atas perintah user): trend lebih kuat (K 0.4 -> 0.6) + ekor
+# mixture sedikit lebih sempit (s2 0.15 -> 0.12). Backtest FAA: v1 0.3576
+# -> v2 0.3398 (baseline 0.6365). Ekor asimetris DICOBA dan DITOLAK:
+# memperlebar kuantil atas saja merusak skor (0.43-0.79) karena histori FAA
+# hampir selalu turun; ekor simetris terbukti terbaik.
+Z = [-0.070275, -0.023224, 0.0, 0.023224, 0.070275]
 WIN = 240
-K = 0.4
+K = 0.6
 
 
 def sigmoid(x):
