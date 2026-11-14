@@ -7,28 +7,30 @@ rank-1 loss of 0 is a hardcode, not forecasting):
 
 - Logit space: forecast in logit(p) so low prices (0.006-0.04) behave well.
 - Trend-following drift: drift = recent 240-min logit trend x K/hour.
+- Mean-reversion (v4): pull toward the 24h logit-mean anchor, strength
+  K_mr/hour (exponential approach). A SMALL mean-reversion (K_mr 0.10)
+  fixes v3's biggest weakness — its constant downward bias hurt badly in
+  flat regimes (HOLD calibration q50 0.029 vs ideal 0.50). The anchor
+  counterweights the bias when prices stabilise, without hurting the
+  crash regime. K_mr 0.10 improves BOTH FAA and NVIDIA.
 - Downward bias correction (v3, from calibration audit): the model's
-  quantiles were systematically too high (median coverage 0.441 vs ideal
-  0.50, q75 0.615 vs 0.75, 90% coverage 0.802 vs 0.90). A downward logit
-  bias, scaling with sqrt(horizon), corrects this. Bias -0.30 at h=240.
+  quantiles were systematically too high. A downward logit bias, scaling
+  with sqrt(horizon), corrects this. Bias -0.30 at h=240.
 - Wide mixture tails: FAA jumps are huge (1-min logit move up to 2.6),
   so quantiles use a two-component mixture (85% N(0,0.03^2) +
   15% N(0,0.12^2)) instead of a narrow normal.
   Precomputed quantiles Z = [-0.070275, -0.023224, 0, 0.023224, 0.070275]
   per sqrt(min). No level-dependent spread.
 
-Backtest on FAA history (16 checkpoints, 240-min horizon, 4 markets):
+Backtest on FAA history (22 checkpoints, 240-min horizon, 4 markets):
   v1 (K 0.4, s2 0.15) 0.3576 -> v2 (K 0.6, s2 0.12) 0.3398
-  -> v3 (K 0.35, bias -0.30) 0.3043, house baseline 0.6365.
-  v3 is a 10.4% improvement over v2 on FAA and also beats the house
-  baseline on NVIDIA practice (0.3524 vs 0.3636), while v2 did not
-  (0.4038). Parameters chosen for ROBUSTNESS across both regimes, not
-  for the extreme FAA-only optimum (K 0.2, bias -0.60 scores 0.2894 on
-  FAA but 0.3896 on NVIDIA — overfit, rejected).
-Asymmetric upper tails were tried and REJECTED (0.43-0.79). Horizon
-decay was tried and REJECTED (0.39-0.56). Regime detection, cross-market
-features, two-component trend, per-market tails, regression trend, EWMA,
-vol-adaptive spread — all tried and REJECTED (all worse than v2).
+  -> v3 (K 0.35, bias -0.30) 0.2852
+  -> v4 (K 0.35, bias -0.30, K_mr 0.10) 0.2649, house baseline 0.5302.
+  v4 beats v3 on ALL splits (DEV 0.3359 vs 0.3403, ROLL 0.2271 vs 0.2443,
+  HOLD 0.1842 vs 0.2341) and on NVIDIA practice (0.3469 vs 0.3524,
+  baseline 0.3636). LOCO NVIDIA: v4 wins 5/6 cases.
+  K_mr 0.10 is the robust optimum: K_mr 0.20 improves FAA further (0.2534)
+  but hurts NVIDIA (0.3598); K_mr 0.30+ hurts NVIDIA badly (0.3782).
 Deterministic, no network, stdlib only.
 """
 import json
@@ -36,16 +38,18 @@ import math
 import os
 
 TAUS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# v3 (audit + kalibrasi, MASTER INSTRUCTION 14 Nov 2026):
-# K 0.6 -> 0.35 (tren lebih lemah) + bias logit -0.30 (koreksi kalibrasi).
-# Backtest FAA: v2 0.3398 -> v3 0.3043 (baseline 0.6365).
-# NVIDIA: v2 0.4038 -> v3 0.3524 (baseline 0.3636) — v3 mengalahkan
-# baseline di KEDUA rezim, v2 tidak. Parameter dipilih untuk robustness,
-# bukan optimum ekstrem FAA saja (K 0.2/bias -0.60 = 0.2894 FAA tapi
-# 0.3896 NVIDIA = overfit, ditolak).
+# v4 (hybrid tren + mean-reversion, PRACTICE OPTIMIZATION 14 Nov 2026):
+# v3 + K_mr 0.10 (tarik ke anchor rata-rata logit 24 jam, eksponensial).
+# Memperbaiki kelemahan terbesar v3 (bias merusak saat flat).
+# FAA: v3 0.2852 -> v4 0.2649 (baseline 0.5302). NVIDIA: v3 0.3524 -> v4 0.3469
+# (baseline 0.3636). LOCO NVIDIA: v4 menang 5/6 case. Split FAA: v4 menang
+# di DEV, ROLL, dan HOLD. K_mr 0.10 adalah optimum robust (K_mr 0.20
+# memperbaiki FAA jadi 0.2534 tapi merusak NVIDIA jadi 0.3598).
 Z = [-0.070275, -0.023224, 0.0, 0.023224, 0.070275]
 WIN = 240
+WIN24 = 1440
 K = 0.35
+K_MR = 0.10
 BIAS = -0.30
 
 
@@ -72,9 +76,12 @@ def forecast_case(case):
         n = len(prices)
         w = min(WIN, n - 1)
         drift = (lx - logit(prices[-1 - w])) * (60.0 / w) * K if w > 0 else 0.0
+        w24 = min(WIN24, n)
+        anchor = sum(logit(p) for p in prices[-w24:]) / w24 if w24 > 0 else lx
         rows = []
         for h in range(1, horizon + 1):
-            center = lx + drift * h / 60.0 + BIAS * math.sqrt(h) / math.sqrt(240.0)
+            mr_part = (anchor - lx) * (1.0 - math.exp(-K_MR * h / 60.0))
+            center = lx + drift * h / 60.0 + mr_part + BIAS * math.sqrt(h) / math.sqrt(240.0)
             s = math.sqrt(h)
             row = []
             for z in Z:
